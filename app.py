@@ -112,10 +112,10 @@ def preprocess_image(image):
     ])
     return transform(image).unsqueeze(0).to(device)
 
-def generate_caption(model, feature_extractor, image_tensor, vocab, max_len=20):
+def generate_caption_greedy(model, feature_extractor, image_tensor, vocab, max_len=20):
+    """Generate caption using greedy search (always picks most likely word)"""
     with torch.no_grad():
         # 1. Extract features (ResNet)
-        # Output shape: (1, 2048, 1, 1) -> Flatten to (1, 2048)
         features = feature_extractor(image_tensor)
         features = features.view(features.size(0), -1)
         
@@ -145,6 +145,69 @@ def generate_caption(model, feature_extractor, image_tensor, vocab, max_len=20):
             
     return " ".join(caption)
 
+def generate_caption_beam_search(model, feature_extractor, image_tensor, vocab, max_len=20, beam_width=3):
+    """Generate caption using beam search (explores multiple paths)"""
+    with torch.no_grad():
+        # Extract features
+        features = feature_extractor(image_tensor)
+        features = features.view(features.size(0), -1)
+        encoder_out = model.encoder(features)
+        
+        # Initialize beam: list of (caption, log_prob, hidden_state)
+        start_token = vocab.stoi["<start>"]
+        hidden = (encoder_out.unsqueeze(0), torch.zeros_like(encoder_out.unsqueeze(0)))
+        
+        # Start with the <start> token
+        beams = [([start_token], 0.0, hidden)]
+        completed_captions = []
+        
+        for _ in range(max_len):
+            new_beams = []
+            
+            for caption, log_prob, hidden in beams:
+                # Get last word
+                input_word = torch.tensor([[caption[-1]]]).to(device)
+                
+                # Forward pass
+                embedding = model.decoder.embed(input_word)
+                output, new_hidden = model.decoder.lstm(embedding, hidden)
+                output = model.decoder.linear(output.squeeze(1))
+                
+                # Get top k predictions
+                log_probs = torch.log_softmax(output, dim=1)
+                top_log_probs, top_indices = log_probs.topk(beam_width, dim=1)
+                
+                # Expand beam
+                for i in range(beam_width):
+                    word_idx = top_indices[0][i].item()
+                    word_log_prob = top_log_probs[0][i].item()
+                    new_caption = caption + [word_idx]
+                    new_log_prob = log_prob + word_log_prob
+                    
+                    # Check if this sequence ended
+                    if word_idx == vocab.stoi["<end>"]:
+                        completed_captions.append((new_caption[1:-1], new_log_prob))
+                    else:
+                        new_beams.append((new_caption, new_log_prob, new_hidden))
+            
+            # Keep only top beam_width beams
+            beams = sorted(new_beams, key=lambda x: x[1], reverse=True)[:beam_width]
+            
+            # Stop if all beams ended
+            if not beams:
+                break
+        
+        # Add remaining beams to completed captions
+        for caption, log_prob, _ in beams:
+            completed_captions.append((caption[1:], log_prob))
+        
+        # Select best caption
+        if completed_captions:
+            best_caption, _ = max(completed_captions, key=lambda x: x[1])
+            return " ".join([vocab.itos[idx] for idx in best_caption])
+        
+        return "Unable to generate caption"
+
 # ==========================================
 # 3. THE STREAMLIT UI
 # ==========================================
@@ -170,16 +233,28 @@ except Exception as e:
 uploaded_file = st.file_uploader("Choose an image...", type=["jpg", "png", "jpeg"])
 
 if uploaded_file is not None:
-    col1, col2 = st.columns(2)
+    image = Image.open(uploaded_file).convert("RGB")
+    st.image(image, caption="Your Image", use_container_width=True)
     
-    with col1:
-        image = Image.open(uploaded_file).convert("RGB")
-        st.image(image, caption="Your Image", use_container_width=True)
+    st.write("---")
     
-    with col2:
-        st.write("### Prediction")
-        if st.button("Generate Caption 🪄"):
-            with st.spinner("Analyzing pixels..."):
-                img_tensor = preprocess_image(image)
-                caption = generate_caption(model, feature_extractor, img_tensor, vocab)
-                st.info(f"**{caption}**")
+    if st.button("Generate Captions 🪄", use_container_width=True):
+        with st.spinner("Analyzing pixels..."):
+            img_tensor = preprocess_image(image)
+            
+            # Generate both captions
+            greedy_caption = generate_caption_greedy(model, feature_extractor, img_tensor, vocab)
+            beam_caption = generate_caption_beam_search(model, feature_extractor, img_tensor, vocab)
+            
+            # Display results side by side
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.write("### 🎯 Greedy Search")
+                st.info(f"**{greedy_caption}**")
+                st.caption("Picks the most likely word at each step")
+            
+            with col2:
+                st.write("### 🔍 Beam Search")
+                st.success(f"**{beam_caption}**")
+                st.caption("Explores multiple paths for better results")
